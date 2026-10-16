@@ -78,7 +78,7 @@ else:
         st.metric("🚫 अनसीन (बाहर) अंक", f"{len(unseen_pool)} अंक", delta="0 बार (विंडो से बाहर)", delta_color="inverse")
 
     st.markdown("---")
-    
+
     # 2. पूल्स विवरण
     c1, c2, c3 = st.columns(3)
     with c1:
