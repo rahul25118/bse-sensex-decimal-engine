@@ -1,138 +1,175 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-from collections import Counter
-from datetime import datetime, time
-import pytz
+"""
+BSE SENSEX CLOSING DECIMAL ENGINE - 100% PERSISTENT ACROSS BROWSER RELOADS
+Multi Cut-off Windows: 03:15 PM, 03:20 PM, 03:25 PM IST
+"""
 
-st.set_page_config(page_title="Pre-Close Decimal Engine", page_icon="🎯", layout="wide")
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import pytz
+from datetime import datetime
+
+st.set_page_config(
+    page_title="BSE Sensex Cut-Off Decimal Engine (Locked)",
+    page_icon="🔒",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 IST = pytz.timezone("Asia/Kolkata")
-HKT = pytz.timezone("Asia/Hong_Kong")
+now_ist = datetime.now(IST)
+today_str = now_ist.strftime("%Y-%m-%d")
 
-st.title("🎯 Pre-Close Decimal Engine (T-10 Min Lock)")
-st.caption("BSE Sensex (8 Low + 7 High) & Hang Seng Index (9 Low + 6 High)")
+SYMBOL = "^BSESN"
 
-@st.cache_data(ttl=10)
-def fetch_clean_index(symbol, tz_str):
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period="60d", interval="2m")
-    if df.empty or len(df) < 30:
-        df = ticker.history(period="60d", interval="5m")
+CUTOFFS = {
+    "Cut-off 1 (03:15 PM)": {
+        "cutoff_hour": 15,
+        "cutoff_min": 15,
+        "cutoff_label": "03:15 PM IST"
+    },
+    "Cut-off 2 (03:20 PM)": {
+        "cutoff_hour": 15,
+        "cutoff_min": 20,
+        "cutoff_label": "03:20 PM IST"
+    },
+    "Cut-off 3 (03:25 PM)": {
+        "cutoff_hour": 15,
+        "cutoff_min": 25,
+        "cutoff_label": "03:25 PM IST"
+    }
+}
+
+def extract_dec(price: float) -> int:
+    return int(f"{price:.2f}".split(".")[1])
+
+def get_band(center_dec: int, half_size: int = 7) -> set:
+    return {(center_dec + k) % 100 for k in range(-half_size, half_size + 1)}
+
+# कट-ऑफ पार होने के बाद सर्वर मेमोरी में स्थायी लॉक (ttl=None)
+@st.cache_data(ttl=None, show_spinner=False)
+def get_locked_bse_data(symbol: str, date_str: str, cut_h: int, cut_m: int):
+    t = yf.Ticker(symbol)
+    df = t.history(period="5d", interval="5m")
     if df.empty:
-        df = ticker.history(period="60d", interval="1d")
-        
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC").tz_convert(tz_str)
-    else:
-        df.index = df.index.tz_convert(tz_str)
-        
-    df["Date"] = df.index.date
-    df["Decimal"] = df["Close"].apply(lambda x: f"{float(x):.2f}".split(".")[1].zfill(2))
-    
-    df_daily = ticker.history(period="60d", interval="1d")
-    daily_closes = {}
-    if not df_daily.empty:
-        if isinstance(df_daily.columns, pd.MultiIndex):
-            df_daily.columns = df_daily.columns.get_level_values(0)
-        for d, row in df_daily.iterrows():
-            daily_closes[d.date()] = (row["Close"], f"{float(row['Close']):.2f}".split(".")[1].zfill(2))
-            
-    return df, daily_closes
-
-def run_engine(day_df, official_close_tuple, lock_str, core_start_str, late_start_str, low_k, high_k):
-    lock_t = pd.to_datetime(lock_str).time()
-    core_t = pd.to_datetime(core_start_str).time()
-    late_t = pd.to_datetime(late_start_str).time()
-    
-    df_pre = day_df[day_df.index.time <= lock_t]
-    win_core = day_df[(day_df.index.time >= core_t) & (day_df.index.time <= lock_t)]
-    win_late = day_df[(day_df.index.time >= late_t) & (day_df.index.time <= lock_t)]
-    
-    if df_pre.empty:
         return None
-        
-    all_day_counts = Counter(df_pre["Decimal"])
-    core_counts = Counter(win_core["Decimal"])
-    late_counts = Counter(win_late["Decimal"])
-    
-    repeaters = [k for k, v in core_counts.items() if v >= 2]
-    uniques = [k for k, v in core_counts.items() if v == 1]
-    confirmed = [k for k in uniques if all_day_counts.get(k, 0) >= 3]
-    late_u = [k for k, v in late_counts.items() if v == 1]
-    
-    pool = list(dict.fromkeys(repeaters + confirmed + late_u))
-    
-    if len(pool) < 15:
-        for d in df_pre["Decimal"].tolist()[::-1]:
-            if d not in pool:
-                pool.append(d)
-            if len(pool) == 15:
-                break
-                
-    pool_sorted = sorted(pool, key=lambda x: int(x))
-    lowest = pool_sorted[:low_k]
-    highest = pool_sorted[-high_k:]
-    final_15 = list(dict.fromkeys(lowest + highest))
-    
-    if official_close_tuple:
-        actual_price, actual_dec = official_close_tuple
+
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC").tz_convert(IST)
     else:
-        actual_price = day_df.iloc[-1]["Close"]
-        actual_dec = day_df.iloc[-1]["Decimal"]
-        
-    is_market_closed = day_df.index[-1].time() > lock_t
-    is_hit = False
-    side = "PENDING"
-    if is_market_closed:
-        is_hit = actual_dec in final_15
-        if is_hit:
-            side = "🟢 LOW SIDE" if actual_dec in lowest else "🔴 HIGH SIDE"
-        else:
-            side = "❌ MISS"
-            
+        df.index = df.index.tz_convert(IST)
+
+    cutoff_limit = now_ist.replace(hour=cut_h, minute=cut_m, second=0, microsecond=0)
+    filtered = df[df.index <= cutoff_limit]
+    if filtered.empty:
+        filtered = df
+
+    target_row = filtered.iloc[-1]
+    price = float(target_row["Close"])
+    bar_time = filtered.index[-1].strftime("%I:%M %p IST")
+
+    # इंडिकेटिव VWAP (कट-ऑफ से पहले की 15 बार्स)
+    win = filtered.tail(15)
+    typ_p = (win["High"] + win["Low"] + win["Close"]) / 3.0
+    vol = win["Volume"]
+    vwap = (typ_p * vol).sum() / vol.sum() if vol.sum() > 0 else typ_p.mean()
+
+    dec_p = extract_dec(price)
+    dec_v = extract_dec(vwap)
+    band_p = get_band(dec_p, 7)
+    band_v = get_band(dec_v, 7)
+
     return {
-        "price_at_lock": df_pre.iloc[-1]["Close"],
-        "actual_price": actual_price,
-        "actual_dec": actual_dec,
-        "lowest": lowest,
-        "highest": highest,
-        "final_15": final_15,
-        "is_hit": is_hit,
-        "is_closed": is_market_closed,
-        "side": side
+        "price": price,
+        "dec_p": dec_p,
+        "vwap": vwap,
+        "dec_v": dec_v,
+        "combined": sorted(list(band_p.union(band_v))),
+        "prime": sorted(list(band_p.intersection(band_v))),
+        "locked_bar_time": bar_time
     }
 
-tab_bse, tab_hsi = st.tabs(["🏛️ BSE Sensex (8 Low + 7 High)", "🇭🇰 Hang Seng Index (9 Low + 6 High)"])
+# कट-ऑफ से पहले लाइव ट्रैकिंग (15 सेकंड कैश)
+@st.cache_data(ttl=15, show_spinner=False)
+def get_live_bse_data(symbol: str):
+    t = yf.Ticker(symbol)
+    df = t.history(period="2d", interval="5m")
+    if df.empty:
+        return None
 
-with tab_bse:
-    now_ist = datetime.now(IST)
-    bse_df, bse_daily = fetch_clean_index("^BSESN", "Asia/Kolkata")
-    bse_dates = sorted(bse_df["Date"].unique(), reverse=True)
-    sel_bse_date = st.selectbox("तारीख चुनें (BSE Sensex):", bse_dates, key="bse_box_final")
-    
-    res_b = run_engine(bse_df[bse_df["Date"] == sel_bse_date], bse_daily.get(sel_bse_date), "15:20:00", "14:00:00", "15:00:00", 8, 7)
-    if res_b:
-        st.subheader("🎯 15 उम्मीदवारों की मुख्य बास्केट (BSE Sensex)")
-        st.write(" ".join([f"` .{x} `" if x != res_b['actual_dec'] else f"**:green[🎯 .{x} (HIT)]**" for x in res_b['final_15']]))
-        c1, c2, c3 = st.columns(3)
-        c1.metric("03:20 PM लॉक भाव", f"{res_b['price_at_lock']:.2f}")
-        c2.metric("03:30 PM आधिकारिक क्लोज", f"{res_b['actual_price']:.2f} (.{res_b['actual_dec']})")
-        c3.metric("परिणाम", "✅ HIT" if res_b["is_hit"] else "❌ MISS", res_b["side"])
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC").tz_convert(IST)
+    else:
+        df.index = df.index.tz_convert(IST)
 
-with tab_hsi:
-    now_hkt = datetime.now(HKT)
-    hsi_df, hsi_daily = fetch_clean_index("^HSI", "Asia/Hong_Kong")
-    hsi_dates = sorted(hsi_df["Date"].unique(), reverse=True)
-    sel_hsi_date = st.selectbox("तारीख चुनें (Hang Seng Index):", hsi_dates, key="hsi_box_final")
-    
-    res_h = run_engine(hsi_df[hsi_df["Date"] == sel_hsi_date], hsi_daily.get(sel_hsi_date), "15:50:00", "14:30:00", "15:30:00", 9, 6)
-    if res_h:
-        st.subheader("🎯 15 उम्मीदवारों की मुख्य बास्केट (Hang Seng ^HSI)")
-        st.write(" ".join([f"` .{x} `" if x != res_h['actual_dec'] else f"**:green[🎯 .{x} (HIT)]**" for x in res_h['final_15']]))
-        c1, c2, c3 = st.columns(3)
-        c1.metric("03:50 PM लॉक भाव (^HSI)", f"{res_h['price_at_lock']:.2f}")
-        c2.metric("04:08 PM आधिकारिक क्लोज (^HSI)", f"{res_h['actual_price']:.2f} (.{res_h['actual_dec']})")
-        c3.metric("परिणाम", "✅ HIT" if res_h["is_hit"] else "❌ MISS", res_h["side"])
+    target_row = df.iloc[-1]
+    price = float(target_row["Close"])
+    bar_time = df.index[-1].strftime("%I:%M %p IST")
+
+    win = df.tail(15)
+    typ_p = (win["High"] + win["Low"] + win["Close"]) / 3.0
+    vol = win["Volume"]
+    vwap = (typ_p * vol).sum() / vol.sum() if vol.sum() > 0 else typ_p.mean()
+
+    dec_p = extract_dec(price)
+    dec_v = extract_dec(vwap)
+    band_p = get_band(dec_p, 7)
+    band_v = get_band(dec_v, 7)
+
+    return {
+        "price": price,
+        "dec_p": dec_p,
+        "vwap": vwap,
+        "dec_v": dec_v,
+        "combined": sorted(list(band_p.union(band_v))),
+        "prime": sorted(list(band_p.intersection(band_v))),
+        "locked_bar_time": bar_time
+    }
+
+st.title("🔒 BSE Sensex कट-ऑफ परमानेंट लॉक इंजन")
+st.caption("कट-ऑफ 1: 03:15 PM • कट-ऑफ 2: 03:20 PM • कट-ऑफ 3: 03:25 PM IST")
+
+cols = st.columns(3)
+
+for idx_i, (c_name, meta) in enumerate(CUTOFFS.items()):
+    with cols[idx_i]:
+        st.subheader(c_name)
+        st.caption(f"कट-ऑफ विंडो: **{meta['cutoff_label']}**")
+
+        cut_h = meta["cutoff_hour"]
+        cut_m = meta["cutoff_min"]
+        is_locked = (now_ist.hour > cut_h) or (now_ist.hour == cut_h and now_ist.minute >= cut_m)
+
+        if is_locked:
+            # सर्वर के परमानेंट मेमोरी कैश से डेटा आएगा (रीलोड पर कभी नहीं बदलेगा)
+            res = get_locked_bse_data(SYMBOL, today_str, cut_h, cut_m)
+            st.success(f"🔒 **डेटा स्थायी रूप से लॉक है ({meta['cutoff_label']})**")
+        else:
+            # कट-ऑफ से पहले लाइव टिक चलेगा
+            res = get_live_bse_data(SYMBOL)
+            st.warning(f"⏳ लाइव चल रहा है (कट-ऑफ {meta['cutoff_label']} पर लॉक होगा)")
+
+        if not res:
+            st.error("डेटा लोड नहीं हो सका।")
+            continue
+
+        st.metric(
+            label="BSE Sensex भाव (INR)",
+            value=f"{res['price']:,.2f}",
+            delta=f"दशमलव: .{res['dec_p']:02d}"
+        )
+        st.write(f"• इंडिकेटिव VWAP: **.{res['dec_v']:02d}** ({res['vwap']:,.2f})")
+        st.caption(f"🔒 लॉक्ड टिक समय: `{res['locked_bar_time']}`")
+
+        st.markdown(f"**🔥 प्राइम कोर ({len(res['prime'])} nos):**")
+        if res["prime"]:
+            st.markdown(" ".join([f"` .{x:02d} `" for x in res["prime"]]))
+        else:
+            st.caption("कोई प्राइम ओवरलैप नहीं")
+
+        st.markdown(f"**📋 पूर्ण बास्केट ({len(res['combined'])} नंबर्स):**")
+        st.markdown(" ".join([
+            f"<span style='background-color:#1e293b;color:#38bdf8;padding:4px 8px;border-radius:4px;font-weight:bold;margin:2px;display:inline-block;'>.{x:02d}</span>"
+            for x in res["combined"]
+        ]), unsafe_allow_html=True)
